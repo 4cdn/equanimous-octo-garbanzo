@@ -59,27 +59,37 @@ class SRNd(threading.Thread):
       dir_ = os.path.join(self.config['data_dir'], 'config', 'hooks', directory)
       if not os.path.exists(dir_):
         os.makedirs(dir_)
-      os.chmod(dir_, 0o777) # FIXME think about this, o+r should be enough?
 
     # install / update plugins
     self.log(self.logger.INFO, "installing / updating plugins")
     for directory in os.listdir('install_files'):
       copy_tree(os.path.join('install_files', directory), os.path.join(self.config['data_dir'], directory), preserve_times=True, update=True)
-    if self.config['setuid'] != '':
-      self.log(self.logger.INFO, "fixing plugin permissions")
-      for directory in os.listdir(os.path.join(self.config['data_dir'], 'plugins')):
-        try:
-          os.chown(os.path.join(self.config['data_dir'], 'plugins', directory), self.config['uid'], self.config['gid'])
-        except OSError as e:
-          if e.errno == 1:
-            # FIXME what does this errno actually mean? write actual descriptions for error codes -.-
-            self.log(self.logger.WARNING, "couldn't change owner of %s. %s will likely fail to create own directories." % (os.path.join(self.config['data_dir'], 'plugins', directory), directory))
-          else:
-            # FIXME: exit might not allow logger to actually output the message.
-            self.log(self.logger.CRITICAL, "trying to chown plugin directory %s failed: %s" % (os.path.join(self.config['data_dir'], 'plugins', directory), e))
-            exit(1)
+
     #add data_dir in syspath
     sys.path.append(os.path.abspath(self.config['data_dir']))
+
+    # create jail
+    os.chdir(self.config['data_dir'])
+
+    # create db dir, migrate
+    if not os.path.exists(self.config['db_dir']):
+      os.makedirs(self.config['db_dir'])
+    self._auto_db_migration()
+
+    # fix permission
+    self.log(self.logger.INFO, "fixing permissions...")
+    self._deep_permission_fix('plugins')
+    self._deep_permission_fix('config')
+    self._deep_permission_fix(self.config['db_dir'])
+    self._deep_permission_fix('srnd')
+
+    # init db manager
+    self._db_manager = __import__('srnd.db_utils').db_utils.DatabaseManager(self.config['db_dir'])
+
+    # importing plugins
+    # we need to do this before chrooting because plugins may need to import other libraries
+    self.plugins = dict()
+    self.update_plugins()
 
     # start listening
     if self.config['bind_use_ipv6']:
@@ -107,26 +117,6 @@ class SRNd(threading.Thread):
       else:
         raise e
     self.socket.listen(5)
-
-    # create jail
-    os.chdir(self.config['data_dir'])
-
-    # init db manager
-    if not os.path.exists(self.config['db_dir']):
-      os.makedirs(self.config['db_dir'])
-    # fix permissin for chroot
-    if self.config['setuid'] != '':
-      os.chown(self.config['db_dir'], self.config['uid'], self.config['gid'])
-    else:
-      os.chown(self.config['db_dir'], os.geteuid(), os.getegid())
-
-    self._db_manager = __import__('srnd.db_utils').db_utils.DatabaseManager(self.config['db_dir'])
-    self._auto_db_migration()
-
-    # reading and starting plugins
-    # we need to do this before chrooting because plugins may need to import other libraries
-    self.plugins = dict()
-    self.update_plugins()
 
     if self.config['use_chroot']:
       self.log(self.logger.INFO, 'chrooting..')
@@ -211,6 +201,27 @@ class SRNd(threading.Thread):
           os.rename(target[1], new_location)
         except OSError as e:
           self.log(self.logger.ERROR, 'DB migrator: Error move {} to {}: {}'.format(target[1], new_location, e))
+
+  def _deep_permission_fix(self, path):
+    """Set permission and owner to all files and directories"""
+    #TODO: 755 or 777? Or maybe 700
+    mode_dir = 0o755 # rwxr-x-r-x
+    mode_file = 0o644 # rw-r--r--
+    if self.config['setuid'] != '':
+      owner = (self.config['uid'], self.config['gid'])
+    else:
+      owner = (os.geteuid(), os.getegid())
+    for dirpath, _, filenames in os.walk(path):
+      self._permission_fix(mode_dir, owner, dirpath)
+      for file_ in filenames:
+        self._permission_fix(mode_file, owner, os.path.join(dirpath, file_))
+
+  def _permission_fix(self, mode, owner, path):
+    try:
+      os.chmod(path, mode)
+      os.chown(path, owner[0], owner[1])
+    except OSError as e:
+      self.log(self.logger.ERROR, "couldn't change owner or permission of {}: {}".format(path, e))
 
   def get_info(self, data=None):
     if data is not None and data.get('command', None) in self.ctl_socket_handlers:
