@@ -18,8 +18,10 @@ from datetime import datetime
 from hashlib import sha1, sha256, sha512
 from urllib import unquote
 
-import Image, ImageDraw, ImageFilter, ImageFont
 import nacl.signing
+
+from srnd.utils import chrootRandom, str_reaper
+from captcha import Captcha
 
 class postman(BaseHTTPRequestHandler):
 
@@ -60,7 +62,7 @@ class postman(BaseHTTPRequestHandler):
   def do_GET(self):
     cookie = self.get_cookie('sid')
     if cookie and cookie in self.origin.spammers:
-      self.origin.log(self.origin.logger.WARNING, 'GET recognized an earlier spammer trying to access %s! %s' % (self.path, cookie))
+      self.origin.log(self.origin.logger.VERBOSE, 'GET recognized an earlier spammer trying to access %s! %s' % (self.path, cookie))
       self._spammers_spam()
       return
     self.path = unquote(self.path)
@@ -84,7 +86,7 @@ class postman(BaseHTTPRequestHandler):
     if add_spamheader:
       if len(self.origin.spammers) > 255:
         self.origin.spammers = list()
-      cookie = ''.join(random.choice(self.origin.captcha_alphabet) for x in range(16))
+      cookie = ''.join(random.choice(self.origin.alphabet) for x in range(16))
       self.origin.spammers.append(cookie)
       self.send_header('Set-Cookie', 'sid=%s; path=/incoming' % cookie)
     self.send_header('Content-type', 'text/html')
@@ -124,7 +126,7 @@ class postman(BaseHTTPRequestHandler):
         self.failCaptcha(post_vars)
         return
     if not self.origin.captcha_require_cookie:
-      if self.origin.captcha_verify(post_vars['expires'].value, post_vars['hash'].value, post_vars['solution'].value, self.origin.captcha_secret):
+      if self.origin.captcha.captcha_verify(post_vars['expires'].value, post_vars['hash'].value, post_vars['solution'].value):
         self.handleNewArticle(post_vars)
         return
       self.failCaptcha(post_vars)
@@ -141,7 +143,7 @@ class postman(BaseHTTPRequestHandler):
     if len(cookie) != 32:
       self.failCaptcha(post_vars)
       return
-    if self.origin.captcha_verify(post_vars['expires'].value, post_vars['hash'].value, post_vars['solution'].value, self.origin.captcha_secret + cookie):
+    if self.origin.captcha.captcha_verify(post_vars['expires'].value, post_vars['hash'].value, post_vars['solution'].value, cookie):
       self.handleNewArticle(post_vars)
       return
     self.failCaptcha(post_vars)
@@ -152,8 +154,8 @@ class postman(BaseHTTPRequestHandler):
     self.end_headers()
     self.wfile.write('<html><body>')
     for y in range(0, 100):
-      #self.wfile.write('<img src="/img/%s.png" style="width: 100px;" />' % ''.join(random.choice(self.origin.captcha_alphabet) for x in range(16)))
-      self.wfile.write('<iframe src="/incoming/%s"></iframe>' % ''.join(random.choice(self.origin.captcha_alphabet) for x in range(16)))
+      #self.wfile.write('<img src="/img/%s.png" style="width: 100px;" />' % ''.join(random.choice(self.origin.alphabet) for x in range(16)))
+      self.wfile.write('<iframe src="/incoming/%s"></iframe>' % ''.join(random.choice(self.origin.alphabet) for x in range(16)))
       #time.sleep(0.1)
     self.wfile.write('</body></html>')
 
@@ -177,9 +179,6 @@ class postman(BaseHTTPRequestHandler):
     if not 'frontend' in post_vars:
       self.die('frontend not in post_vars')
       return
-    else:
-      frontend = post_vars.getvalue('frontend', '').replace('"', '&quot;')
-    reply = post_vars.getvalue('reply', '').replace('"', '&quot;')
     #if frontend == 'overchan' and reply != '':
     #  # FIXME add ^ allow_reply_bypass to frontend configuration
     #  if self.origin.captcha_bypass_after_timestamp_reply < int(time.time()):
@@ -194,65 +193,89 @@ class postman(BaseHTTPRequestHandler):
       elif self.origin.receive_from_friends == 2:
         self.die('Anonymous posting is not allowed on this frontend.')
         return
-    board = post_vars.getvalue('board', '').replace('"', '&quot;')
-    target = post_vars.getvalue('target', '').replace('"', '&quot;')
-    name = post_vars.getvalue('name', '').replace('"', '&quot;')
-    email = post_vars.getvalue('email', '').replace('"', '&quot;')
-    subject = post_vars.getvalue('subject', '').replace('"', '&quot;')
-    if post_vars.getvalue('hash', '') != '':
-      comment = post_vars.getvalue('comment', '').replace('"', '&quot;')
-      file_name = post_vars.getvalue('file_name', '').replace('"', '&quot;')
-      file_ct = post_vars.getvalue('file_ct', '').replace('"', '&quot;')
-      file_b64 = post_vars.getvalue('file_b64', '').replace('"', '&quot;')
-    else:
-      comment = base64.encodestring(post_vars.getvalue('comment', ''))
-      if not 'allowed_files' in self.origin.frontends[frontend]:
-        file_name = ''
-        file_ct = ''
-        file_b64 = ''
-      else:
-        try:
-          file_name = post_vars['file'].filename.replace('"', '&quot;')
-        except KeyError:
-          file_name = ''
-        if file_name == '':
-          file_ct = ''
-          file_b64 = ''
-        else:
-          file_ct = post_vars['file'].type.replace('"', '&quot;')
-          f = cStringIO.StringIO()
-          base64.encode(post_vars['file'].file, f)
-          file_b64 = f.getvalue()
-          f.close()
+    data = self._extract_base_headers(post_vars)
+    data['message'] = message
     if failed:
       identifier = sha256()
-      identifier.update(frontend + board + reply + target + name + email + subject)
-      identifier.update(comment)
+      identifier.update(''.join((data['frontend'], data['board'], data['reply'], data['target'], data['name'], data['email'], data['subject'])))
+      identifier.update(data['comment'])
       self.origin.log(self.origin.logger.WARNING, 'failed capture try for %s' % identifier.hexdigest())
       self.origin.log(self.origin.logger.WARNING, self.headers)
-    passphrase = ''.join([random.choice(self.origin.captcha_alphabet) for i in xrange(self.origin.captcha_len)])
-    #passphrase += ' ' + ''.join([random.choice(self.origin.captcha_alphabet) for i in xrange(6)])
-    b64 = self.origin.captcha_render_b64(passphrase, self.origin.captcha_tiles, self.origin.get_captcha_font(), self.origin.captcha_filter)
+    self.send_response(200)
+    self.send_header('Content-type', 'text/html')
     if self.origin.captcha_require_cookie:
-      cookie = ''.join(random.choice(self.origin.captcha_alphabet) for x in range(32))
-      expires, solution_hash = self.origin.captcha_generate(passphrase, self.origin.captcha_secret + cookie)
-      self.send_response(200)
-      self.send_header('Content-type', 'text/html')
+      cookie = ''.join(random.choice(self.origin.alphabet) for x in range(32))
       self.send_header('Set-Cookie', 'session=%s; path=/incoming/verify' % cookie)
     else:
-      expires, solution_hash = self.origin.captcha_generate(passphrase, self.origin.captcha_secret)
-      self.send_response(200)
-      self.send_header('Content-type', 'text/html')
+      cookie = ''
+    data['b64'], data['expires'], data['solution_hash'] = self.origin.captcha.get_captcha(cookie)
     self.end_headers()
     # use file_name as key and file content + current time as value
     if self.origin.fast_uploads:
-      if file_b64 != '':
+      if data['file_b64']:
         # we can have empty file_b64 here whether captcha was entered wrong first time
-        self.origin.temp_file_obj[file_name] = [file_b64, int(time.time())]
-      self.wfile.write(self.origin.template_verify_fast.format(message, b64, solution_hash, expires, frontend, board, reply, target, name, email, subject, comment, file_name, file_ct))
+        self.origin.temp_file_obj[data['file_name']] = [data.pop('file_b64'), int(time.time())]
+      self.wfile.write(self.origin.t_engine['verify_fast'].substitute(data))
     else:
-      self.wfile.write(self.origin.template_verify_slow.format(message, b64, solution_hash, expires, frontend, board, reply, target, name, email, subject, comment, file_name, file_ct, file_b64))
-    return self.origin.captcha_cache_bump()
+      self.wfile.write(self.origin.t_engine['verify_slow'].substitute(data))
+    return self.origin.captcha.cache_bump()
+
+  def _extract_base_headers(self, post_vars):
+    data = {
+        'frontend': post_vars.getvalue('frontend', '').replace('"', '&quot;'),
+        'reply': post_vars.getvalue('reply', '').replace('"', '&quot;'),
+        'board': post_vars.getvalue('board', '').replace('"', '&quot;'),
+        'target': post_vars.getvalue('target', '').replace('"', '&quot;'),
+        'name': post_vars.getvalue('name', '').replace('"', '&quot;'),
+        'email': post_vars.getvalue('email', '').replace('"', '&quot;'),
+        'subject': post_vars.getvalue('subject', '').replace('"', '&quot;')
+    }
+    data['custom_headers'] = self._custom_headers_to_html(self._get_custom_headers(post_vars, data['frontend']))
+    if post_vars.getvalue('hash', '') != '':
+      data['comment'] = post_vars.getvalue('comment', '').replace('"', '&quot;')
+      data['file_name'] = post_vars.getvalue('file_name', '').replace('"', '&quot;')
+      data['file_ct'] = post_vars.getvalue('file_ct', '').replace('"', '&quot;')
+      data['file_b64'] = post_vars.getvalue('file_b64', '').replace('"', '&quot;')
+    else:
+      data['comment'] = base64.encodestring(post_vars.getvalue('comment', ''))
+      data['file_name'], data['file_ct'], data['file_b64'] = '', '', ''
+      if 'allowed_files' in self.origin.frontends[data['frontend']]:
+        try:
+          data['file_name'] = post_vars['file'].filename.replace('"', '&quot;')
+        except KeyError:
+          pass
+        if data['file_name']:
+          data['file_ct'] = post_vars['file'].type.replace('"', '&quot;')
+          f = cStringIO.StringIO()
+          base64.encode(post_vars['file'].file, f)
+          data['file_b64'] = f.getvalue()
+          f.close()
+    return data
+
+  @staticmethod
+  def _custom_headers_to_article(custom_headers):
+    """return headers to insert into the article. Also, bump first letter in key"""
+    form_ = '\n{}: {}'
+    return ''.join(form_.format(key.capitalize(), str_reaper(value)) for key, value in custom_headers.items())
+
+  @staticmethod
+  def _custom_headers_to_html(custom_headers):
+    """return headers to insert into the captcha page"""
+    form_ = '\n        <input type="hidden" name="{}" value="{}" />'
+    return ''.join(form_.format(key, value.replace('"', '&quot;')) for key, value in custom_headers.items())
+
+  def _get_custom_headers(self, post_vars, frontend):
+    """extract custom headers. If header empty or missing - use default value if default value not empty. Return header: value dict"""
+    custom_headers = dict()
+    if 'custom' not in self.origin.frontends[frontend]:
+      return custom_headers
+    for key, def_val in self.origin.frontends[frontend]['custom'].items():
+      value = post_vars.getvalue(key, def_val).split('\n')[0].strip()
+      if not value:
+        value = def_val
+      if value:
+        custom_headers[key] = value
+    return custom_headers
 
   def fake_id_to_overchan_id(self, comment, board):
     def reverse_mapping(rematch):
@@ -275,7 +298,6 @@ class postman(BaseHTTPRequestHandler):
       self.die('frontend not in post_vars')
       return
     frontend = post_vars['frontend'].value
-    self.origin.log(self.origin.logger.INFO, "got incoming article from %s:%i for frontend '%s'" % (self.client_address[0], self.client_address[1], frontend))
     if not 'target' in post_vars:
       self.die('target not in post_vars')
       return
@@ -390,7 +412,7 @@ class postman(BaseHTTPRequestHandler):
 
     if 'subject' in post_vars:
       if post_vars['subject'].value.split('\n')[0] != '':
-        subject = post_vars['subject'].value.split('\n')[0]
+        subject = str_reaper(post_vars['subject'].value.split('\n')[0], 128)
 
     sage = ''
     if 'allow_sage' in self.origin.frontends[frontend]:
@@ -399,7 +421,7 @@ class postman(BaseHTTPRequestHandler):
             name.lower().startswith('sage') or name.lower().startswith('saging')):
           sage = "\nX-Sage: True"
 
-    sender = '{0} <{1}>'.format(name, email)
+    sender = '{0} <{1}>'.format(str_reaper(name, 64), str_reaper(email, 64))
     reply = ''
     if 'reply' in post_vars:
       reply = post_vars['reply'].value
@@ -428,16 +450,22 @@ class postman(BaseHTTPRequestHandler):
       if i2p_desthash == 'non-i2p' or not self.origin.allow_this_desthash(i2p_desthash):
         self.die('This frontend uses hardened spamprotect. Come back one hour later.')
         return
-    #f = open('tmp/' + boundary, 'w')
-    if signature:
-      link = os.path.join('incoming', 'tmp', boundary + '_')
+
+    custom_headers = self._get_custom_headers(post_vars, frontend)
+    if custom_headers:
+      head_info = ' Custom headers: {}'.format(', '.join(custom_headers.keys()))
+      custom_headers = self._custom_headers_to_article(custom_headers)
     else:
-      link = os.path.join('incoming', 'tmp', boundary)
+      head_info = ''
+      custom_headers = ''
+    self.origin.log(self.origin.logger.INFO, "got incoming {} from {}:{} for frontend '{}'.{}".format(message_uid, self.client_address[0], self.client_address[1], frontend, head_info))
+
+    link = os.path.join('incoming', 'tmp', boundary + '_') if signature else os.path.join('incoming', 'tmp', boundary)
     f = open(link, 'w')
     if file_name == '':
-      f.write(self.origin.template_message_nopic.format(sender, date, group, subject, message_uid, reply, uid_host, comment, sage, i2p_desthash).replace('\r', ''))
+      f.write(self.origin.template_message_nopic.format(sender, date, group, subject, message_uid, reply, uid_host, comment, sage, i2p_desthash, custom_headers).replace('\r', ''))
     else:
-      f.write(self.origin.template_message_pic.format(sender, date, group, subject, message_uid, reply, uid_host, boundary, comment, content_type, file_name, sage, i2p_desthash).replace('\r', ''))
+      f.write(self.origin.template_message_pic.format(sender, date, group, subject, message_uid, reply, uid_host, boundary, comment, content_type, file_name, sage, i2p_desthash, custom_headers).replace('\r', ''))
       if 'hash' in post_vars:
         if self.origin.fast_uploads:
           # get file looking by file_name
@@ -468,7 +496,7 @@ class postman(BaseHTTPRequestHandler):
       signed = open(link[:-1], 'w')
       f = open(link, 'r')
       link = link[:-1]
-      signed.write(self.origin.template_message_signed.format(sender, date, group, subject, message_uid, reply, uid_host, pubkey, signature, sage, i2p_desthash))
+      signed.write(self.origin.template_message_signed.format(sender, date, group, subject, message_uid, reply, uid_host, pubkey, signature, sage, i2p_desthash, custom_headers))
       f.seek(0)
       for line in f:
         signed.write(line)
@@ -584,30 +612,19 @@ class main(threading.Thread):
 
     self.log(self.logger.DEBUG, 'initializing httpserver..')
     self.httpd = HTTPServer((self.ip, self.port), postman)
-    if os.path.exists('seed'):
-      f = open('seed', 'r')
-      self.httpd.seed = f.read()
-      f.close()
-    else:
-      f = open('/dev/urandom', 'r')
-      self.httpd.seed = f.read(32)
-      f.close()
-      f = open('seed', 'w')
-      f.write(self.httpd.seed)
-      f.close()
-      os.chmod('seed', 0o600)
+    self.httpd.seed = chrootRandom(32)
 
-    self.new_captcha = None
+    new_captcha = None
     if 'new_captcha' in args:
       if args['new_captcha'].lower() in ('true', 'yes'):
-        self.new_captcha = 2
+        new_captcha = 2
       else:
         try:
-          self.new_captcha = int(args['new_captcha'])
+          new_captcha = int(args['new_captcha'])
         except ValueError:
           pass
-        if self.new_captcha is not None and (self.new_captcha < 0 or self.new_captcha > 100):
-          self.new_captcha = 2
+        if new_captcha is not None and (new_captcha < 0 or new_captcha > 100):
+          new_captcha = 2
 
     self.httpd.receive_from_friends = 0
     if 'receive_from_friends' in args:
@@ -658,14 +675,13 @@ class main(threading.Thread):
     f = open(os.path.join(template_directory, 'redirect.template'), 'r')
     self.httpd.template_redirect = f.read()
     f.close()
+    self.httpd.t_engine = dict()
     if self.httpd.fast_uploads:
-      f = open(os.path.join(template_directory, 'verify_fast.template'), 'r')
-      self.httpd.template_verify_fast = f.read()
-      f.close()
+      with open(os.path.join(template_directory, 'verify_fast.tmpl'), 'r') as f:
+        self.httpd.t_engine['verify_fast'] = string.Template(f.read())
     else:
-      f = open(os.path.join(template_directory, 'verify_slow.template'), 'r')
-      self.httpd.template_verify_slow = f.read()
-      f.close()
+      with open(os.path.join(template_directory, 'verify_slow.tmpl'), 'r') as f:
+        self.httpd.t_engine['verify_slow'] = string.Template(f.read())
 
     # read frontends
     self.httpd.frontends = self._read_frontends(args['frontend_directory'])
@@ -717,40 +733,14 @@ class main(threading.Thread):
     self.httpd.fake_ok = False
     self.httpd.captcha_verification = True
     self.httpd.captcha_require_cookie = False
-    self.httpd.captcha_len = 6
     self.httpd.captcha_bypass_after_seconds_reply = 60 * 10
     self.httpd.captcha_bypass_after_timestamp_reply = int(time.time())
-    self.httpd.captcha_generate = self.captcha_generate
-    if self.new_captcha is not None:
-      self.httpd.captcha_filter = ImageFilter.GaussianBlur(4)
-      self.httpd.captcha_verify = self.new_captcha_verify
-      self.httpd.captcha_alphabet = string.ascii_uppercase + string.digits
-      for char in ('I', 'O', '0', '1'):
-        self.httpd.captcha_alphabet = self.httpd.captcha_alphabet.replace(char, '')
-      self.captcha_alt = new_captcha(self.new_captcha, self.httpd.captcha_filter)
-      self.log(self.logger.INFO, self.captcha_alt.init_cache())
-      self.httpd.captcha_render_b64 = self.captcha_alt.captcha_render_b64
-      self.httpd.get_captcha_font = self.captcha_alt.get_captcha_font
-      self.httpd.captcha_cache_bump = self.captcha_alt.captcha_cache_bump
-    else:
-      self.httpd.captcha_filter = ImageFilter.EMBOSS
-      self.httpd.captcha_verify = self.captcha_verify
-      self.httpd.captcha_alphabet = string.ascii_letters + string.digits
-      for char in ('I', 'l', 'O', '0', 'k', 'K'):
-        self.httpd.captcha_alphabet = self.httpd.captcha_alphabet.replace(char, '')
-      self.httpd.captcha_render_b64 = self.captcha_render_b64
-      self.httpd.get_captcha_font = self.get_captcha_font
-      self.httpd.captcha_cache_bump = self.captcha_cache_bump
-    self.httpd.captcha_tiles = list()
-    self.httpd.captcha_backlog = list()
-    self.httpd.captcha_backlog_maxlen = 100
-    for item in os.listdir('plugins/postman/tiles'):
-      self.httpd.captcha_tiles.append(Image.open('plugins/postman/tiles/%s' % item))
-    foobar = self.captcha_render_b64('abc', self.httpd.captcha_tiles, self.httpd.get_captcha_font(), self.httpd.captcha_filter)
+
+    self.httpd.captcha = Captcha(log=self.log, logger=self.logger, diff_mode=new_captcha)
+    self.alphabet = string.ascii_uppercase + string.digits
+    foobar = self.httpd.captcha.get_captcha('cookie')
     del foobar
-    f = open('/dev/urandom', 'r')
-    self.httpd.captcha_secret = f.read(32)
-    f.close()
+
     # read captcha quotes from file
     qoutefile = 'plugins/postman/quotes.txt'
     if os.path.exists(qoutefile):
@@ -910,90 +900,6 @@ class main(threading.Thread):
       self.save_i2p_spamprotect_cache()
     self.log(self.logger.INFO, 'bye')
 
-  @staticmethod
-  def captcha_generate(text, secret, expires=300):
-    expires += int(time.time())
-    if not expires % 3: solution_hash = sha256('%s%s%i' % (text, secret, expires)).hexdigest()
-    elif expires % 2: solution_hash = sha256('%i%s%s' % (expires, text, secret)).hexdigest()
-    else: solution_hash = sha256('%s%i%s' % (secret, expires, text)).hexdigest()
-    return expires, solution_hash
-
-  def captcha_check_backlog(self, expires, solution_hash):
-    insert_at = len(self.httpd.captcha_backlog)
-    for index, solution in enumerate(self.httpd.captcha_backlog):
-      if expires == solution[0] and solution_hash == solution[1]:
-        self.log(self.logger.WARNING, "captcha replay detected: %s" % solution_hash)
-        return False
-      if solution[0] < expires:
-        insert_at = index
-        break
-    if insert_at != self.httpd.captcha_backlog_maxlen:
-      self.httpd.captcha_backlog.insert(insert_at, (expires, solution_hash))
-      if len(self.httpd.captcha_backlog) > self.httpd.captcha_backlog_maxlen:
-        self.httpd.captcha_backlog.pop()
-    return True
-
-  def new_captcha_verify(self, expires, solution_hash, guess, secret):
-    return self.captcha_verify(expires, solution_hash, guess.upper(), secret)
-
-  def captcha_verify(self, expires, solution_hash, guess, secret):
-    try:
-      expires = int(expires)
-    except ValueError:
-      return False
-    if int(time.time()) > expires or len(guess) != self.httpd.captcha_len or expires - int(time.time()) > 3600:
-      return False
-    if not expires % 3:
-      if solution_hash != sha256('%s%s%i' % (guess, secret, expires)).hexdigest(): return False
-      return self.captcha_check_backlog(expires, solution_hash)
-    if expires % 2:
-      if solution_hash != sha256('%i%s%s' % (expires, guess, secret)).hexdigest(): return False
-      return self.captcha_check_backlog(expires, solution_hash)
-    if solution_hash != sha256('%s%i%s' % (secret, expires, guess)).hexdigest(): return False
-    return self.captcha_check_backlog(expires, solution_hash)
-
-  @staticmethod
-  def get_captcha_font(fontdir='plugins/postman/fonts/'):
-    """ get random font """
-    font = random.choice(os.listdir(fontdir))
-    font = fontdir + font
-    return ImageFont.truetype(font, random.randint(32, 48))
-
-  @staticmethod
-  def captcha_render_b64(guess, tiles, font, filter_=None):
-    """ generate captcha """
-    #if self.captcha_size is None: size = self.defaultSize
-    #img = Image.new("RGB", (256,96))
-    w, h, x, y = 300, 100, 30, 25
-    w += random.randint(4, 50)
-    h += random.randint(4, 50)
-    x += random.randint(4, 50)
-    y += random.randint(4, 50)
-    tile = random.choice(tiles)
-    img = Image.new("RGB", (w, h))
-    for n in range(10):
-      offset = (random.uniform(0, 1), random.uniform(0, 1))
-      for j in xrange(-1, int(img.size[1] / tile.size[1]) + 1):
-        for i in xrange(-1, int(img.size[0] / tile.size[0]) + 1):
-          dest = (int((offset[0] + i) * tile.size[0]),
-                  int((offset[1] + j) * tile.size[1]))
-          img.paste(tile, dest)
-    draw = ImageDraw.Draw(img)
-    #draw.text((40,20), guess, font=font, fill='white')
-    draw.text((x, y), guess, font=font, fill='black')
-    if filter_:
-      img = img.filter(filter_)
-    f = cStringIO.StringIO()
-    img.save(f, 'PNG')
-    content = f.getvalue()
-    f.close()
-    return content.encode("base64").replace("\n", "")
-
-  @staticmethod
-  def captcha_cache_bump():
-    # TODO: create captcha before query
-    return True
-
   def allow_this_cookie(self, cookie):
     if cookie == '' or cookie in self.httpd.cookie_disallow:
       return False
@@ -1137,126 +1043,6 @@ class main(threading.Thread):
       del self.httpd.userkey_list[pubkey]
       self.httpd.postmandb.execute('UPDATE userkey SET allow = 0 WHERE userkey = ?', (pubkey,))
       self.httpd.postmandb.commit()
-
-class new_captcha(object):
-  def __init__(self, diff=2, img_filter=None):
-    self.img_filter = img_filter
-    self.gauss = diff
-    self.plazma_cache = dict()
-    self.plazma_cache_size = 15
-    self.plazma_cache['reusage'] = 0
-    self.plazma_cache['plazma'] = [None] * self.plazma_cache_size
-    self.plazma_cache['size'] = list()
-
-  def init_cache(self):
-    check_time = time.time()
-    self.__init_cache()
-    return 'new_captcha: init %s plazma cache in %s seconds...' % (self.plazma_cache_size, int(time.time() - check_time))
-
-  def __init_cache(self):
-    self.plazma_cache['size'] = [
-        300 + random.randint(4, 50),
-        100 + random.randint(4, 50)
-    ]
-    for x in xrange(self.plazma_cache_size):
-      self.plazma_cache['plazma'][x] = self.__plazma(self.plazma_cache['size'][0], self.plazma_cache['size'][1])
-    self.plazma_cache['reusage'] = random.randint(2, 5) * self.plazma_cache_size
-
-  @staticmethod
-  def get_captcha_font(fontdir='plugins/postman/fonts/'):
-    #font = random.choice(os.listdir(fontdir))
-    #font = fontdir + font
-    font_list = ('FreeSansBold.ttf', 'FreeSerifBold.ttf', 'FreeMonoBold.ttf')
-    font = fontdir + font_list[random.randint(0, 2)]
-    return ImageFont.truetype(font, random.randint(43, 54))
-
-  def captcha_render_b64(self, guess, tiles, font, filter_=None):
-    img_to_str = cStringIO.StringIO()
-    self.captcha(guess, font).save(img_to_str, 'PNG')
-    content = img_to_str.getvalue()
-    img_to_str.close()
-    return content.encode("base64").replace("\n", "")
-
-  def captcha_cache_bump(self):
-    if self.plazma_cache['reusage'] <= 0:
-      self.__init_cache()
-    return True
-
-  def captcha(self, guess, font):
-    if self.plazma_cache['reusage'] <= -5:
-      self.__init_cache()
-    self.plazma_cache['reusage'] -= 1
-    mask = Image.new('RGBA', (self.plazma_cache['size'][0], self.plazma_cache['size'][1]))
-    font_width, font_height = font.getsize(guess)
-    font_width /= len(guess)
-
-    x_offset = random.randint(-1, 1) * 5
-
-    draw = ImageDraw.Draw(mask)
-    for i in guess:
-      x_offset += font_width + random.randint(1, 5)
-      y_offset = random.randint(1, 7) * 5
-      draw.text((x_offset + random.randint(-(font_width / 10), (font_width / 10)) * 2, y_offset), i, font=font)
-
-    angle = random.randint(-2, 3) * 5
-    mask = mask.rotate(angle)
-
-    pattern_1 = pattern_2 = None
-    while pattern_1 is pattern_2:
-      pattern_1 = self.plazma_cache['plazma'][random.randint(0, self.plazma_cache_size - 1)]
-      pattern_2 = self.plazma_cache['plazma'][random.randint(0, self.plazma_cache_size - 1)]
-
-    result = Image.composite(pattern_1, pattern_2, mask)
-
-    if self.img_filter is not None:
-      for x in range(self.gauss):
-        result = result.filter(self.img_filter)
-
-    return result
-
-  def __plazma(self, width, height):
-    plazma = Image.new('RGB', (width, height))
-    pix = plazma.load()
-
-    for xy in [(0, 0), (width-1, 0), (0, height-1), (width-1, height-1)]:
-      rgb = []
-      for i in xrange(3):
-        rgb.append(int(random.random()*256))
-      pix[xy[0], xy[1]] = (rgb[0], rgb[1], rgb[2])
-
-    self.__plazmaRec(pix, 0, 0, width-1, height-1)
-    return plazma
-
-  def __plazmaRec(self, pix, x1, y1, x2, y2):
-    if (abs(x1 - x2) <= 1) and (abs(y1 - y2) <= 1):
-      return
-    rgb = []
-    for i in xrange(3):
-      rgb.append((pix[x1, y1][i] + pix[x1, y2][i])/2)
-      rgb.append((pix[x2, y1][i] + pix[x2, y2][i])/2)
-      rgb.append((pix[x1, y1][i] + pix[x2, y1][i])/2)
-      rgb.append((pix[x1, y2][i] + pix[x2, y2][i])/2)
-
-      tmp = (pix[x1, y1][i] + pix[x1, y2][i] +
-             pix[x2, y1][i] + pix[x2, y2][i])/4
-      diagonal = ((x1-x2)**2 + (y1-y2)**2)**0.5
-      while True:
-        delta = int(((random.random() - 0.5) / 100 * min(100, diagonal)) * 255)
-        if (tmp + delta >= 0) and (tmp + delta <= 255):
-          tmp += delta
-          break
-      rgb.append(tmp)
-
-    pix[x1, (y1 + y2)/2] = (rgb[0], rgb[5], rgb[10])
-    pix[x2, (y1 + y2)/2] = (rgb[1], rgb[6], rgb[11])
-    pix[(x1 + x2)/2, y1] = (rgb[2], rgb[7], rgb[12])
-    pix[(x1 + x2)/2, y2] = (rgb[3], rgb[8], rgb[13])
-    pix[(x1 + x2)/2, (y1 + y2)/2] = (rgb[4], rgb[9], rgb[14])
-
-    self.__plazmaRec(pix, x1, y1, (x1+x2)/2, (y1+y2)/2)
-    self.__plazmaRec(pix, (x1+x2)/2, y1, x2, (y1+y2)/2)
-    self.__plazmaRec(pix, x1, (y1+y2)/2, (x1+x2)/2, y2)
-    self.__plazmaRec(pix, (x1+x2)/2, (y1+y2)/2, x2, y2)
 
 if __name__ == '__main__':
   args = dict()

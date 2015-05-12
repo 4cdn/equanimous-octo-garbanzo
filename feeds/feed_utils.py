@@ -4,6 +4,10 @@ import random
 import string
 import os
 import time
+import zlib
+
+class GzipError(Exception):
+  pass
 
 class InBuffer(object):
   def __init__(self):
@@ -12,22 +16,33 @@ class InBuffer(object):
   def set_multiline(self):
     self.multiline = True
 
+  def enable_gzip(self):
+    if self._buffer:
+      raise GzipError('enable gzip - buffer is not empty. WTF?')
+    self._zip = zlib.decompressobj(zlib.MAX_WBITS | 16)
+
   def add(self, data):
     # no data. Need reconnection
-    if len(data) == 0:
+    if not data:
       return False
-    self._buffer += data
-    if not '\r\n' in self._buffer:
+    self._buffer += data if self._zip is None else self._decompress(data)
+    if '\r\n' not in self._buffer:
       return True
     split_data = self._buffer.split('\r\n')
     self._buffer = split_data.pop(-1)
     self._data.extend(split_data)
     return True
 
+  def _decompress(self, data):
+    data = self._zip.decompress(data)
+    if self._zip.unused_data:
+      raise GzipError('decompress - received not compressed data. WTF?')
+    return data
+
   def read(self):
     if self._data:
       for line in self._data:
-        if len(line) == 1 and line[0] == '.':
+        if line == '.':
           self.multiline = False
           # multiline is complit
           yield False
@@ -36,9 +51,23 @@ class InBuffer(object):
       del self._data[:]
 
   def reset(self):
+    self._zip = None
     self._buffer = ''
     self.multiline = False
     self._data = []
+
+class Compressor(object):
+  def __init__(self):
+    self._zip = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+
+  def compress(self, data):
+    return self._zip.compress(data)
+
+  def sync(self, data):
+    return self._zip.compress(data) + self._zip.flush(zlib.Z_SYNC_FLUSH)
+
+  def sync_force(self):
+    return self._zip.flush(zlib.Z_SYNC_FLUSH)
 
 class HandleIncoming(object):
   def __init__(self, infeed_name='_unnamed_', tmp_path=os.path.join('incoming', 'tmp')):

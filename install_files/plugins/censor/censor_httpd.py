@@ -11,13 +11,13 @@ import string
 import threading
 import time
 import json
+import urlparse
 from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
 from binascii import hexlify, unhexlify
 from cgi import FieldStorage
 from datetime import datetime, timedelta
 from hashlib import sha1, sha512
-from urllib import unquote
-from urlparse import urlparse, parse_qs
+from urllib import unquote, urlencode
 
 from srnd.utils import basicHTMLencode, basicHTMLencodeNoStrip
 
@@ -110,17 +110,19 @@ class censor(BaseHTTPRequestHandler):
       if path.startswith('/modify?'):
         self.send_modify_key(path[8:])
       elif path.startswith('/pic_log'):
-        try: page = int(path[9:])
-        except ValueError: page = 1
-        if page < 1: page = 1
+        page = self._get_positive_int(path[9:], 1)
         self.send_piclog(page)
       elif path.startswith('/moderation_log'):
-        try:    page = int(path[16:])
-        except ValueError: page = 1
-        if page == 0: page = 1
+        try:
+          page = int(path[16:])
+        except ValueError:
+          page = 1
+        if page == 0:
+          page = 1
         self.send_log(page)
       elif path.startswith('/message_log'):
-        self.send_messagelog(parse_qs(urlparse(path).query))
+        data = dict(urlparse.parse_qsl(urlparse.urlsplit(unquote(path)).query))
+        self.send_messagelog(data, path[12:])
       elif path.startswith('/stats'):
         self.send_stats()
       elif path.startswith('/settings'):
@@ -136,8 +138,9 @@ class censor(BaseHTTPRequestHandler):
       elif path.startswith('/restore?'):
         self.handle_restore(path[9:])
       elif path.startswith('/info'):
-        data = parse_qs(urlparse(unquote(path)).query)
-        self.send_info({x: ''.join(data[x]).encode('ascii', 'ignore') for x in data})
+        data = urlparse.parse_qs(urlparse.urlparse(unquote(path)).query)
+        data = {x: ''.join(data[x]).encode('ascii', 'ignore') for x in data}
+        self.send_info(data)
       elif path.startswith('/notimplementedyet'):
         self._send_error('not implemented yet')
       else:
@@ -523,6 +526,14 @@ class censor(BaseHTTPRequestHandler):
     else:
       return line
 
+  @staticmethod
+  def _pagination_construct(backward=None, forward=None):
+    link_ = u'<a href="{}">{}</a>'
+    titles = (u'previous', u'next')
+    backward = link_.format(backward, titles[0]) if backward else titles[0]
+    forward = link_.format(forward, titles[1]) if forward else titles[1]
+    return u'<div style="float:right;">{}&nbsp;{}</div>'.format(backward, forward)
+
   def send_log(self, page=1, pagecount=100):
     log_body = dict()
     if page < 0:
@@ -538,12 +549,8 @@ class censor(BaseHTTPRequestHandler):
       log_body['accepted_log'] = 'accepted log'
       log_body['ignored_log'] = '<a href="moderation_log?-1">ignored log</a>'
       help_target = 'moderation_accepted_log'
-    log_body['pagination'] = '<div style="float:right;">'
-    if page > 1:
-      log_body['pagination'] += '<a href="moderation_log?%i">previous</a>' % ((page-1)*page_corrector)
-    else:
-      log_body['pagination'] += 'previous'
-    log_body['pagination'] += '&nbsp;<a href="moderation_log?%i">next</a></div>' % ((page+1)*page_corrector)
+    backward = 'moderation_log?%i' % ((page-1)*page_corrector) if page > 1 else None
+    log_body['pagination'] = self._pagination_construct(backward, 'moderation_log?%i' % ((page+1)*page_corrector))
     log_body['navigation'] = self.__get_navigation('moderation_log', add_after=log_body['pagination'])
     table = list()
     for row in self.origin.sqlite_censor.execute("SELECT key, local_name, command, data, reason, comment, timestamp, log.source FROM log, commands, keys, reasons WHERE\
@@ -639,55 +646,84 @@ class censor(BaseHTTPRequestHandler):
     self.end_headers()
     self.wfile.write("\n".join(table))
 
-  def send_messagelog(self, query_data={}):
-    message_log = dict()
-    query_str = unicode(''.join(query_data.get('q', '')), 'utf-8')
-    message_log['count'] = unicode(''.join(query_data.get('c', '100')), 'utf-8')
-    try: message_log['count'] = int(message_log['count'])
-    except ValueError: message_log['count'] = 100
-    if message_log['count'] < 1: message_log['count'] = 1
-    message_log['search_action'] = 'message_log'
-    message_log['search_target'] = query_str
-    message_log['navigation'] = self.__get_navigation('message_log')
-    if len(query_str) < 3:
-      data_row = self.origin.sqlite_overchan.execute('SELECT article_uid, parent, sender, subject, message, parent, public_key, sent, group_name FROM articles, groups WHERE \
-        groups.group_id = articles.group_id ORDER BY articles.sent DESC LIMIT ?', (message_log['count'],)).fetchall()
+  @staticmethod
+  def _get_positive_int(data, default=100):
+    try:
+      data = int(data)
+    except ValueError:
+      return default
     else:
-      data_row = self.origin.sqlite_overchan.execute('SELECT article_uid, parent, sender, subject, message, parent, public_key, sent, group_name FROM articles, groups WHERE \
-        groups.group_id = articles.group_id AND message LIKE ? ORDER BY articles.sent DESC LIMIT ?', ('%'+query_str+'%', message_log['count'])).fetchall()
-    message_log['content'] = self.send_messagelog_construct(data_row)
-    message_log['target'] = self.root_path + 'message_log'
+      return data if data > 0 else 1
+
+  def send_messagelog(self, data, raw_data):
+    message_log = dict()
+    message_log['search_target'] = data.get('q', '').decode('UTF-8', errors='replace')
+    message_log['count'] = self._get_positive_int(data.get('c', 100))
+    page = self._get_positive_int(data.get('page', 1), 1)
+    message_log['search_action'] = ''
+    db_target = data.get('db', 'overchan').encode('ascii', errors='replace')
+    dbs = {'overchan': 'Overchan', 'pastes': 'Pastes'}
+    if db_target not in dbs:
+      db_target = 'overchan'
+    message_log['more'] = ' db: <select name="db">{}<select>'.format(self.__selector_construct(dbs, db_target))
+    message_log['content'] = self.send_messagelog_construct(message_log['count'], message_log['search_target'], db_target, page)
+
+    backward, forward = '', ''
+    if page > 1:
+      data2 = data.copy()
+      data2['page'] = page - 1
+      backward = 'message_log?{}'.format(urlencode(data2))
+    if message_log['content']:
+      data2 = data.copy()
+      data2['page'] = page + 1
+      forward = 'message_log?{}'.format(urlencode(data2))
+    message_log['pagination'] = self._pagination_construct(backward, forward)
+    message_log['navigation'] = self.__get_navigation('message_log', add_after=message_log['pagination'])
+    message_log['target'] = u'{}{}{}'.format(self.root_path, 'message_log', raw_data.decode('UTF-8', errors='replace'))
     self._substitute_and_send(self.origin.t_engine_message_log, message_log, 'send_messagelog')
 
-  def send_messagelog_construct(self, data_row):
+  def _messagelog_iterator(self, count, find_me, db_target, page):
+    handler = self.origin.pastesdb if db_target == 'pastes' else self.origin.sqlite_overchan
+    if len(find_me) < 3:
+      params = ((page - 1) * count, count)
+      if db_target == 'pastes':
+        query = 'SELECT article_uid, "", sender, subject, body, sent, case when hidden = 0 then lang else "[private]" || lang end FROM pastes ORDER BY sent DESC LIMIT ?, ?'
+      else:
+        query = 'SELECT article_uid, parent, sender, subject, message, sent, group_name FROM articles, groups WHERE groups.group_id = articles.group_id ORDER BY articles.sent DESC LIMIT ?, ?'
+    else:
+      params = (u'%{}%'.format(find_me), (page - 1) * count, count)
+      if db_target == 'pastes':
+        query = 'SELECT article_uid, "", sender, subject, body, sent, case when hidden = 0 then lang else "[private]" || lang end FROM pastes WHERE body LIKE ? ORDER BY sent DESC LIMIT ?, ?'
+      else:
+        query = 'SELECT article_uid, parent, sender, subject, message, sent, group_name FROM articles, groups WHERE groups.group_id = articles.group_id AND message LIKE ? ORDER BY articles.sent DESC LIMIT ?, ?'
+    for row in handler.execute(query, params).fetchall():
+      yield row
+
+  def send_messagelog_construct(self, count, find_me, db_target, page):
     table = list()
-    for row in data_row:
+    link_ = 'paste/' if db_target == 'pastes' else 'thread-'
+    for row in self._messagelog_iterator(count, find_me, db_target, page):
       message_log_row = dict()
       articlehash_full = sha1(row[0]).hexdigest()
       if row[1] == '' or row[1] == row[0]:
         # parent
-        message_log_row['link'] = "thread-%s.html" % articlehash_full[:10]
+        message_log_row['link'] = "%s%s.html" % (link_, articlehash_full[:10])
         message_log_row['delete_taget'] = 'thread'
       else:
-        message_log_row['link'] = "thread-%s.html#%s" % (sha1(row[1]).hexdigest()[:10], articlehash_full[:10])
+        message_log_row['link'] = "%s%s.html#%s" % (link_, sha1(row[1]).hexdigest()[:10], articlehash_full[:10])
         message_log_row['delete_taget'] = 'post'
-      subject = row[3]
-      message = row[4]
-      if len(subject) > 40:
-        subject = subject[:38] + '..'
-      if len(message) > 200:
-        message = message[:200] + " [..]"
       message_log_row['sender'] = row[2][:15]
-      message_log_row['subject'] = self.origin.breaker.sub(self.__breakit, subject)
-      message_log_row['message'] = self.origin.breaker.sub(self.__breakit, message)
-      message_log_row['group_name'] = row[8]
-      message_log_row['sent'] = datetime.utcfromtimestamp(row[7]).strftime('%Y/%m/%d %H:%M')
+      message_log_row['subject'] = row[3][:38] + '..' if len(row[3]) > 40 else row[3]
+      message_ = row[4][:200] + ' [..]' if len(row[4]) > 205 else row[4]
+      message_log_row['message'] = basicHTMLencode(message_) if db_target == 'pastes' else message_
+      message_log_row['group_name'] = row[6]
+      message_log_row['sent'] = datetime.utcfromtimestamp(row[5]).strftime('%Y/%m/%d %H:%M')
       message_log_row['articlehash_full'] = articlehash_full
       message_log_row['articlehash'] = articlehash_full[:10]
       table.append(self.origin.t_engine_message_log_row.substitute(message_log_row))
     return '\n'.join(table)
 
-  def send_stats(self, page=0):
+  def send_stats(self):
     stats_data = dict()
     t_2_rows = '<tr><td class="right">%s</td><td>%s</td></tr>'
     t_3_rows = '<tr><td>%s</td><td class="right">%s</td><td>%s</td></tr>'
@@ -1225,10 +1261,6 @@ class censor(BaseHTTPRequestHandler):
   def __get_messages_id_by_dest_hash(self, dest_hash):
     return self.origin.sqlite_hasher.execute("SELECT message_id FROM article_hashes WHERE sender_desthash = ?", (dest_hash,)).fetchall()
 
-  @staticmethod
-  def __breakit(rematch):
-    return '%s ' % rematch.group(0)
-
   def handle_moderation_request(self):
     post_vars = self.post_vars_init()
 
@@ -1386,7 +1418,7 @@ class censor_httpd(threading.Thread):
           self.log(self.logger.WARNING, 'debuglevel not between 0 and 5, using default of debug = %i' % self.loglevel)
         else:
           self.log(self.logger.DEBUG, 'using debuglevel %i' % self.loglevel)
-      except ValueError as e:
+      except ValueError:
         self.loglevel = self.logger.INFO
         self.log(self.logger.WARNING, 'debuglevel not between 0 and 5, using default of debug = %i' % self.loglevel)
     self.log(self.logger.DEBUG, 'initializing as plugin..')
@@ -1440,7 +1472,6 @@ class censor_httpd(threading.Thread):
     self.httpd.uid_host = self.uid_host
     self.httpd.censor = args['censor']
     self.httpd.weekdays = ('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
-    self.httpd.breaker = re.compile('([^ ]{16})')
     self.httpd.runtime_salt = self.httpd.rnd.read(8)
 
     # read templates
@@ -1603,6 +1634,7 @@ class censor_httpd(threading.Thread):
     self.httpd.sqlite_censor = self._db_connector('censor', timeout=60)
     self.httpd.sqlite_overchan = self._db_connector('overchan', timeout=60)
     self.httpd.postmandb = self._db_connector('postman', timeout=60)
+    self.httpd.pastesdb = self._db_connector('pastes', timeout=60)
 
     self.log(self.logger.INFO, 'start listening at http://%s:%i' % (self.ip, self.port))
     self.httpd.serve_forever()
@@ -1610,6 +1642,7 @@ class censor_httpd(threading.Thread):
     self.httpd.sqlite_censor.close()
     self.httpd.sqlite_overchan.close()
     self.httpd.postmandb.close()
+    self.httpd.pastesdb.close()
     self.httpd.rnd.close()
     self.log(self.logger.INFO, 'bye')
 

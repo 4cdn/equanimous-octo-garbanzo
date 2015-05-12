@@ -36,6 +36,7 @@ class SRNd(threading.Thread):
     self.log(self.logger.WARNING,  'srnd test logging with WARNING')
     self.log(self.logger.ERROR,    'srnd test logging with ERROR')
     self.log(self.logger.CRITICAL, 'srnd test logging with CRITICAL')
+    old_owner = (os.stat('data').st_uid, os.stat('data').st_gid) if os.path.exists('data') else (None, None)
     # default config. key = (value, position). position need for write human readable config
     def_config = {
         'bind_ip': ('', 1),
@@ -52,36 +53,86 @@ class SRNd(threading.Thread):
     }
     self.config = self.init_srnd_config(def_config)
 
+    self._use_psutil = psutil_import_result and not self.config['use_chroot']
     self._init_sysinfo()
-
-    # create some directories
-    for directory in ('filesystem', 'outfeeds', 'plugins'):
-      dir_ = os.path.join(self.config['data_dir'], 'config', 'hooks', directory)
-      if not os.path.exists(dir_):
-        os.makedirs(dir_)
 
     # install / update plugins
     self.log(self.logger.INFO, "installing / updating plugins")
     for directory in os.listdir('install_files'):
       copy_tree(os.path.join('install_files', directory), os.path.join(self.config['data_dir'], directory), preserve_times=True, update=True)
 
-    #add data_dir in syspath
+    #add data_dir in syspath and fix permission
     sys.path.append(os.path.abspath(self.config['data_dir']))
 
     # create jail
     os.chdir(self.config['data_dir'])
 
-    # create db dir, migrate
-    if not os.path.exists(self.config['db_dir']):
-      os.makedirs(self.config['db_dir'])
+    # get initial owner
+    init_owner = (os.geteuid(), os.getegid())
+
+    # get owner
+    if self.config['setuid'] != '':
+      owner = (self.config['uid'], self.config['gid'])
+    else:
+      owner = init_owner
+
+    # load\create infeeds.cfg
+    self.infeeds_config = self._load_infeeds_config()
+
+    # test and fixing plugin dir permissions
+    for directory in os.listdir('plugins'):
+      dir_ = os.path.join('plugins', directory)
+      try:
+        self._permission_fix(0o755, owner, dir_)
+      except OSError as e:
+        if e.errno == 1:
+          # FIXME what does this errno actually mean? write actual descriptions for error codes -.-
+          self.log(self.logger.WARNING, "couldn't change owner of %s. %s will likely fail to create own directories." % (dir_, directory))
+        else:
+          # FIXME: exit might not allow logger to actually output the message.
+          self.log(self.logger.CRITICAL, "trying to chown plugin directory %s failed: %s" % (dir_, e))
+          exit(1)
+
+    # create some directories
+    for directory in ('filesystem', 'outfeeds', 'plugins'):
+      dir_ = os.path.join('config', 'hooks', directory)
+      if not os.path.exists(dir_):
+        os.makedirs(dir_)
+
+    # check for directory structure
+    directories = (
+        'incoming',
+        os.path.join('incoming', 'tmp'),
+        os.path.join('incoming', 'spam'),
+        'articles',
+        os.path.join('articles', 'censored'),
+        os.path.join('articles', 'restored'),
+        os.path.join('articles', 'invalid'),
+        os.path.join('articles', 'duplicate'),
+        'groups',
+        'hooks',
+        'stats',
+        self.config['db_dir'])
+    for directory in directories:
+      if not os.path.exists(directory):
+        os.mkdir(directory)
+        self._permission_fix(0o755, owner, directory)
+
+    # migrate db
     self._auto_db_migration()
 
-    # fix permission
-    self.log(self.logger.INFO, "fixing permissions...")
-    self._deep_permission_fix('plugins')
-    self._deep_permission_fix('config')
-    self._deep_permission_fix(self.config['db_dir'])
-    self._deep_permission_fix('srnd')
+    # fix all permission if owner change. it is a long time
+    if old_owner != owner:
+      self.log(self.logger.INFO, "onwer change, fixing all permissions...")
+      self._deep_permission_fix(owner, '.', False)
+
+    # protect some files from changes, if srnd dropping privileges
+    if owner != init_owner:
+      self._protect_files(init_owner)
+
+    # base fixing permissions
+    self._deep_permission_fix(owner, os.path.join('config', 'hooks', 'filesystem'), False)
+    self._deep_permission_fix(owner, self.config['db_dir'], False)
 
     # init db manager
     self._db_manager = __import__('srnd.db_utils').db_utils.DatabaseManager(self.config['db_dir'])
@@ -149,23 +200,6 @@ class SRNd(threading.Thread):
         else:
           raise e
 
-    # check for directory structure
-    directories = (
-        'incoming',
-        os.path.join('incoming', 'tmp'),
-        os.path.join('incoming', 'spam'),
-        'articles',
-        os.path.join('articles', 'censored'),
-        os.path.join('articles', 'restored'),
-        os.path.join('articles', 'invalid'),
-        os.path.join('articles', 'duplicate'),
-        'groups',
-        'hooks',
-        'stats',
-        'plugins')
-    for directory in directories:
-      if not os.path.exists(directory):
-        os.mkdir(directory)
     threading.Thread.__init__(self)
     self.name = "SRNd-listener"
     self.dropper = dropper.dropper(
@@ -202,26 +236,53 @@ class SRNd(threading.Thread):
         except OSError as e:
           self.log(self.logger.ERROR, 'DB migrator: Error move {} to {}: {}'.format(target[1], new_location, e))
 
-  def _deep_permission_fix(self, path):
+  def _deep_permission_fix(self, owner, path, only_dir=True):
     """Set permission and owner to all files and directories"""
     #TODO: 755 or 777? Or maybe 700
-    mode_dir = 0o755 # rwxr-x-r-x
-    mode_file = 0o644 # rw-r--r--
-    if self.config['setuid'] != '':
-      owner = (self.config['uid'], self.config['gid'])
-    else:
-      owner = (os.geteuid(), os.getegid())
+    mode_dir = 0o755 # rwxrwx-r-x
+    mode_file = 0o664 # rw-rw-r--
     for dirpath, _, filenames in os.walk(path):
       self._permission_fix(mode_dir, owner, dirpath)
-      for file_ in filenames:
-        self._permission_fix(mode_file, owner, os.path.join(dirpath, file_))
+      if not only_dir:
+        for file_ in filenames:
+          file_link = os.path.join(dirpath, file_)
+          if not os.path.islink(file_link):
+            # ignore symlinks
+            self._permission_fix(mode_file, owner, file_link)
 
   def _permission_fix(self, mode, owner, path):
     try:
       os.chmod(path, mode)
       os.chown(path, owner[0], owner[1])
     except OSError as e:
-      self.log(self.logger.ERROR, "couldn't change owner or permission of {}: {}".format(path, e))
+      username = pwd.getpwuid(self.config['uid']).pw_name if self.config['setuid'] else pwd.getpwuid(os.geteuid()).pw_name
+      if e.errno == 1:
+        warnings = (
+            "can't change ownership of {}.".format(path),
+            "If you want to run as '{}' user modify {} :".format(username, os.path.join(self.config['data_dir'], 'config', 'SRNd.conf')),
+            "set use_chroot=False, setuid={0}, start SRNd root privileges(su, sudo etc.), stop, wait, and starting SRNd as {0} without root privileges,".format(username),
+            "or change ownership manually eg. 'sudo chown -R {0}:{0} data/', or delete the data directory".format(username),
+            "die."
+        )
+        self.log(self.logger.CRITICAL, '\n'.join(warnings))
+      else:
+        self.log(self.logger.CRITICAL, "couldn't change owner or permission of {}: {}".format(path, e))
+      exit(1)
+
+  def _protect_files(self, owner):
+    mode_file = 0o664
+    # Prevent add and load plugin after dropping privileges
+    for dir_ in ('config', 'srnd'):
+      self._deep_permission_fix(owner, dir_, False)
+    # Prevent modify files and templates files - plugin can be reload
+    # TODO: Protect all plugin files and directories, without tmp and out. Also, templates directory may be renamed in plugin config
+    for plugin_dir in os.listdir('plugins'):
+      for target in os.listdir(os.path.join('plugins', plugin_dir)):
+        path = os.path.join('plugins', plugin_dir, target)
+        if os.path.isfile(path):
+          self._permission_fix(mode_file, owner, path)
+        elif target == 'templates':
+          self._deep_permission_fix(owner, path, False)
 
   def get_info(self, data=None):
     if data is not None and data.get('command', None) in self.ctl_socket_handlers:
@@ -232,12 +293,12 @@ class SRNd(threading.Thread):
   def _get_sysinfo(self, target):
     result = None
     if target == 'cpu':
-      if psutil_import_result:
+      if self._use_psutil:
         result = self._sysinfo['psutil'].cpu_percent(interval=None)
       else:
         result = 0
     elif target == 'ram':
-      if psutil_import_result:
+      if self._use_psutil:
         result = self._sysinfo['psutil'].memory_info()[0]
       else:
         if self._sysinfo['ramfile'] is not None:
@@ -253,7 +314,7 @@ class SRNd(threading.Thread):
 
   def _init_sysinfo(self):
     self._sysinfo = dict()
-    if psutil_import_result:
+    if self._use_psutil:
       self._sysinfo['psutil'] = psutil.Process()
     else:
       try:
@@ -932,8 +993,6 @@ class SRNd(threading.Thread):
     self.start_plugins()
     self.update_hooks()
 
-    self.infeeds_config = self._load_infeeds_config()
-
     self._sync_on_startup()
 
     self.dropper.start()
@@ -1088,6 +1147,7 @@ class SRNd(threading.Thread):
 
   def _infeed_config_sanitize(self, config):
     # 0 - disallow 1 - allow 2 - required
+    config['srndgzip'] = config.get('srndgzip', 'false').lower() in ('true', 'enable', 'on')
     try:
       auth_required = int(config.get('auth_required', 0))
     except ValueError:
@@ -1108,6 +1168,7 @@ class SRNd(threading.Thread):
     return config
 
   def _outfeed_config_sanitize(self, config):
+    config['infinity_stream'] = config.get('infinity_stream', 'false').lower() in ('true', 'on', 'yes', '1')
     config['srndauth_key'] = config.get('srndauth_key')
     if config['srndauth_key'] is not None and len(config['srndauth_key']) != 64:
       self.log(self.logger.WARNING, 'len srndauth_key != 64. Set None')
